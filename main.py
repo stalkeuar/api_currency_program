@@ -1,63 +1,92 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-import httpx
-from typing import Optional
+from dotenv import load_dotenv
+import os
+import requests
+import secrets
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+load_dotenv()
+
+MONOBANK_API = os.getenv("MONOBANK_API", "https://api.monobank.ua/bank/currency")
+INVEST_API_TOKEN = os.getenv("INVEST_API_TOKEN", "")
+AUTH_PASSWORD = os.getenv("AUTH_PASSWORD")
 
 app = FastAPI()
 security = HTTPBasic()
 
-PASSWORD = "dfjgidf5346sggwefrk###gjgkidfjkd"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
-    if credentials.password != PASSWORD:
+def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    if not AUTH_PASSWORD:
+        raise HTTPException(status_code=500, detail="AUTH_PASSWORD не встановлено в .env")
+    correct_password = secrets.compare_digest(credentials.password, AUTH_PASSWORD)
+    if not correct_password:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code=401,
             detail="Невірний пароль",
-            headers={"WWW-Authenticate": "Basic"},
+            headers={"WWW-Authenticate": "Basic"}
         )
-    return True
+    return credentials.username
 
-@app.get("/calculate")
-async def calculate_price(
-    item_name: str,
-    item_price_usd: float,
-    savings_uah: float,
-    authenticated: bool = Depends(authenticate)
+@app.get("/analyze")
+def analyze(
+    rent: float,
+    food: float,
+    other: float,
+    salary: float,
+    username: str = Depends(verify_auth)
 ):
+    expenses = rent + food + other
+    savings_uah = salary - expenses
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get("https://api.monobank.ua/bank/currency")
-        if response.status_code != 200:
-            raise HTTPException(status_code=500, detail="Помилка отримання курсу валют з Monobank")
-        rates = response.json()
+    if savings_uah <= 0:
+        raise HTTPException(status_code=400, detail="Немає заощаджень цього місяця")
 
-    usd_uah_rate = None
-    for rate in rates:
-        if rate["currencyCodeA"] == 840 and rate["currencyCodeB"] == 980:
-            usd_uah_rate = rate["rateSell"]
-            break
+    try:
+        response = requests.get(MONOBANK_API, timeout=5)
+        data = response.json()
 
-    if not usd_uah_rate:
-        raise HTTPException(status_code=500, detail="Не знайдено курс долара до гривні")
+        if not isinstance(data, list):
+            raise ValueError("Очікував список валютних курсів, але отримав щось інше.")
 
-    savings_usd = savings_uah / usd_uah_rate
-    diff = item_price_usd - savings_usd
+        usd = next((x for x in data if x.get("currencyCodeA") == 840 and x.get("currencyCodeB") == 980), None)
 
-    if diff <= 0:
-        message = f"Вітаємо! Ви вже можете придбати '{item_name}' 🥳"
-    elif diff < 100:
-        message = f"Ще трішки попрацювати — і '{item_name}' буде вашим!"
-    elif diff < 1000:
-        message = f"Працювати ще багатенько, але не слід засмучуватись — '{item_name}' нікуди не втече!"
-    else:
-        message = f"Треба шукати нову роботу 😅 До '{item_name}' ще далеко..."
+        if not usd:
+            raise ValueError("Курс USD/UAH не знайдено в відповіді Monobank")
 
-    return {
-        "Назва товару": item_name,
-        "Курс USD": round(usd_uah_rate, 2),
-        "Ваші накопичення в доларах": round(savings_usd, 2),
-        "Ціна товару в доларах": item_price_usd,
-        "Скільки ще треба накопичити": round(max(diff, 0), 2),
-        "Повідомлення": message
-    }
+        rate = usd.get("rateBuy") or usd.get("rateCross")
+        if not rate:
+            raise ValueError("Немає курсу купівлі або перехресного курсу")
 
+        savings_usd = savings_uah / rate
+
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Помилка Monobank: {e}")
+
+    def calc_invest(monthly_amount, months=12, annual_rate=0.1):
+        monthly_rate = annual_rate / 12
+        total = 0
+        for _ in range(months):
+            total = (total + monthly_amount) * (1 + monthly_rate)
+        return total
+
+    try:
+        investment_result = calc_invest(savings_usd)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Інвест-API помилка: {e}")
+
+    return JSONResponse({
+        "Всього витрачаєте на місяць в грн": round(rent + food + other, 2),
+        "Залишок в грн": round(savings_uah, 2),
+        "Залишок в доларах США": round(savings_usd, 2),
+        "Можливо отримати якщо інвестувати кожен місяць": round(investment_result, 2),
+        "Загальний прибуток в доларах": round(investment_result - (savings_usd * 12), 2)
+    })
